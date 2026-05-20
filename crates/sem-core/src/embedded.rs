@@ -521,8 +521,39 @@ pub struct SemReviewLayerPlan {
     pub layers: Vec<SemReviewLayer>,
     #[serde(default)]
     pub manual_review_change_indices: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual_review_atom_ids: Vec<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemReviewAtom {
+    pub atom_id: String,
+    pub file_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub defined_symbols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub referenced_symbols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_range: Option<SemLineRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_range: Option<SemLineRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunk_indices: Vec<usize>,
+    #[serde(default)]
+    pub changed_lines: usize,
+    #[serde(default)]
+    pub manual_review: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +568,8 @@ pub struct SemReviewLayer {
     pub depends_on_layer_ids: Vec<String>,
     #[serde(default)]
     pub change_indices: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub atom_ids: Vec<String>,
     #[serde(default)]
     pub file_paths: Vec<String>,
     #[serde(default)]
@@ -1007,6 +1040,19 @@ pub fn generate_review_layers(
 ) -> SemReviewLayerPlan {
     let analysis = analyze_file_changes(changes, options);
     review_layers_from_analysis(&analysis, layer_options, options)
+}
+
+pub fn generate_review_layers_for_atoms(
+    changes: &[SemFileChange],
+    atoms: &[SemReviewAtom],
+    layer_options: &SemLayerGenerationOptions,
+    options: &SemEmbeddedOptions,
+) -> SemReviewLayerPlan {
+    let analysis = analyze_file_changes(changes, options);
+    let mut plan = review_layers_from_analysis(&analysis, layer_options, options);
+    attach_atoms_to_review_layers(&mut plan, &analysis, atoms, layer_options);
+    plan.cache_key = review_atom_layer_cache_key(&analysis, atoms, layer_options, options);
+    plan
 }
 
 impl From<ContextEntry> for SemContextEntry {
@@ -1578,7 +1624,107 @@ fn review_layers_from_analysis(
         cache_key: review_layer_cache_key(analysis, layer_options, options),
         layers,
         manual_review_change_indices: manual,
+        manual_review_atom_ids: Vec::new(),
         warnings: Vec::new(),
+    }
+}
+
+fn attach_atoms_to_review_layers(
+    plan: &mut SemReviewLayerPlan,
+    analysis: &SemDiffAnalysis,
+    atoms: &[SemReviewAtom],
+    layer_options: &SemLayerGenerationOptions,
+) {
+    let mut assigned_atom_ids = BTreeSet::<String>::new();
+    let manual_atom_ids = atoms
+        .iter()
+        .filter(|atom| atom.manual_review)
+        .map(|atom| atom.atom_id.clone())
+        .collect::<Vec<_>>();
+    plan.manual_review_atom_ids = manual_atom_ids.clone();
+
+    for layer in &mut plan.layers {
+        let layer_changes = layer
+            .change_indices
+            .iter()
+            .filter_map(|index| analysis.changes.get(*index))
+            .collect::<Vec<_>>();
+        let mut atom_ids = atoms
+            .iter()
+            .filter(|atom| !atom.manual_review)
+            .filter(|atom| review_layer_matches_atom(layer, &layer_changes, atom))
+            .map(|atom| atom.atom_id.clone())
+            .collect::<BTreeSet<_>>();
+        for atom_id in &layer.atom_ids {
+            atom_ids.insert(atom_id.clone());
+        }
+        layer.atom_ids = atom_ids.into_iter().collect();
+        assigned_atom_ids.extend(layer.atom_ids.iter().cloned());
+    }
+
+    assign_file_matched_atoms(plan, atoms, &assigned_atom_ids);
+    assigned_atom_ids.extend(
+        plan.layers
+            .iter()
+            .flat_map(|layer| layer.atom_ids.iter().cloned()),
+    );
+
+    let remaining = atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, atom)| !atom.manual_review && !assigned_atom_ids.contains(&atom.atom_id))
+        .map(|(index, atom)| (atom_layer_key(atom), index))
+        .collect::<Vec<_>>();
+    let mut grouped = BTreeMap::<String, Vec<usize>>::new();
+    for (key, index) in remaining {
+        grouped.entry(key).or_default().push(index);
+    }
+
+    for (key, mut atom_indices) in grouped {
+        while !atom_indices.is_empty() && plan.layers.len() < layer_options.max_layers {
+            let take = layer_options
+                .max_changes_per_layer
+                .max(1)
+                .min(atom_indices.len());
+            let chunk = atom_indices.drain(0..take).collect::<Vec<_>>();
+            plan.layers.push(layer_from_atom_indices(
+                plan.layers.len(),
+                &key,
+                chunk,
+                atoms,
+            ));
+        }
+        for index in atom_indices {
+            plan.manual_review_atom_ids
+                .push(atoms[index].atom_id.clone());
+        }
+    }
+
+    for layer in &mut plan.layers {
+        layer.atom_ids.sort();
+        layer.atom_ids.dedup();
+    }
+    plan.manual_review_atom_ids.sort();
+    plan.manual_review_atom_ids.dedup();
+    add_atom_layer_dependencies(&mut plan.layers, atoms);
+}
+
+fn assign_file_matched_atoms(
+    plan: &mut SemReviewLayerPlan,
+    atoms: &[SemReviewAtom],
+    assigned_atom_ids: &BTreeSet<String>,
+) {
+    for atom in atoms {
+        if atom.manual_review || assigned_atom_ids.contains(&atom.atom_id) {
+            continue;
+        }
+        if let Some(layer) = plan
+            .layers
+            .iter_mut()
+            .find(|layer| layer_file_paths_match_atom(layer, atom))
+        {
+            layer.atom_ids.push(atom.atom_id.clone());
+        }
     }
 }
 
@@ -1629,10 +1775,294 @@ fn layer_from_change_indices(
         ),
         depends_on_layer_ids: Vec::new(),
         change_indices,
+        atom_ids: Vec::new(),
         file_paths: file_paths.into_iter().collect(),
         hunk_indices: hunk_indices.into_iter().collect(),
         entity_names: entity_names.into_iter().collect(),
     }
+}
+
+fn layer_from_atom_indices(
+    index: usize,
+    key: &str,
+    atom_indices: Vec<usize>,
+    atoms: &[SemReviewAtom],
+) -> SemReviewLayer {
+    let mut file_paths = BTreeSet::new();
+    let mut hunk_indices = BTreeSet::new();
+    let mut entity_names = BTreeSet::new();
+    let mut changed_lines = 0usize;
+    let mut atom_ids = Vec::new();
+    for atom_index in atom_indices {
+        let atom = &atoms[atom_index];
+        atom_ids.push(atom.atom_id.clone());
+        file_paths.insert(atom.file_path.clone());
+        if let Some(path) = atom.old_file_path.clone() {
+            file_paths.insert(path);
+        }
+        hunk_indices.extend(atom.hunk_indices.iter().copied());
+        if let Some(symbol) = atom.symbol_name.clone() {
+            entity_names.insert(symbol);
+        }
+        entity_names.extend(atom.defined_symbols.iter().cloned());
+        changed_lines += atom.changed_lines;
+    }
+
+    let title = atom_layer_title(key, &entity_names, &file_paths);
+    let id = format!(
+        "sem-atom-layer-{}-{}",
+        index,
+        stable_cache_key("atom-layer", &[title.clone(), atom_ids.join("\n")])
+    );
+    SemReviewLayer {
+        id,
+        index,
+        title: title.clone(),
+        summary: format!(
+            "{} review atom{} across {} file{}.",
+            atom_ids.len(),
+            if atom_ids.len() == 1 { "" } else { "s" },
+            file_paths.len(),
+            if file_paths.len() == 1 { "" } else { "s" }
+        ),
+        rationale: format!(
+            "Grouped by host-provided review atom role `{key}` with {changed_lines} changed line{}.",
+            if changed_lines == 1 { "" } else { "s" }
+        ),
+        depends_on_layer_ids: Vec::new(),
+        change_indices: Vec::new(),
+        atom_ids,
+        file_paths: file_paths.into_iter().collect(),
+        hunk_indices: hunk_indices.into_iter().collect(),
+        entity_names: entity_names.into_iter().collect(),
+    }
+}
+
+fn review_layer_matches_atom(
+    layer: &SemReviewLayer,
+    changes: &[&SemEmbeddedChange],
+    atom: &SemReviewAtom,
+) -> bool {
+    changes
+        .iter()
+        .any(|change| embedded_change_matches_atom(change, atom))
+        || layer_hunks_match_atom(layer, atom)
+        || layer_symbols_match_atom(layer, atom)
+}
+
+fn embedded_change_matches_atom(change: &SemEmbeddedChange, atom: &SemReviewAtom) -> bool {
+    if !change_paths_match_atom(change, atom) {
+        return false;
+    }
+
+    change_hunks_match_atom(change, atom)
+        || change_ranges_match_atom(change, atom)
+        || change_symbols_match_atom(change, atom)
+        || atom.hunk_indices.is_empty() && atom.old_range.is_none() && atom.new_range.is_none()
+}
+
+fn change_paths_match_atom(change: &SemEmbeddedChange, atom: &SemReviewAtom) -> bool {
+    let mut paths = BTreeSet::new();
+    paths.insert(change.change.file_path.as_str());
+    if let Some(path) = change.change.old_file_path.as_deref() {
+        paths.insert(path);
+    }
+    if let Some(range) = change.before_range.as_ref() {
+        paths.insert(range.file_path.as_str());
+    }
+    if let Some(range) = change.after_range.as_ref() {
+        paths.insert(range.file_path.as_str());
+    }
+    paths.iter().any(|path| atom_path_matches(atom, path))
+}
+
+fn change_hunks_match_atom(change: &SemEmbeddedChange, atom: &SemReviewAtom) -> bool {
+    !atom.hunk_indices.is_empty()
+        && change
+            .hunk_overlaps
+            .iter()
+            .any(|overlap| atom.hunk_indices.contains(&overlap.hunk_index))
+}
+
+fn change_ranges_match_atom(change: &SemEmbeddedChange, atom: &SemReviewAtom) -> bool {
+    range_overlaps_entity(atom.old_range, change.before_range.as_ref())
+        || range_overlaps_entity(atom.new_range, change.after_range.as_ref())
+}
+
+fn change_symbols_match_atom(change: &SemEmbeddedChange, atom: &SemReviewAtom) -> bool {
+    let mut change_symbols = BTreeSet::new();
+    change_symbols.insert(change.change.entity_name.as_str());
+    if let Some(name) = change.change.old_entity_name.as_deref() {
+        change_symbols.insert(name);
+    }
+
+    atom.symbol_name
+        .as_deref()
+        .is_some_and(|symbol| change_symbols.contains(symbol))
+        || atom
+            .defined_symbols
+            .iter()
+            .chain(atom.referenced_symbols.iter())
+            .any(|symbol| change_symbols.contains(symbol.as_str()))
+}
+
+fn layer_hunks_match_atom(layer: &SemReviewLayer, atom: &SemReviewAtom) -> bool {
+    layer_file_paths_match_atom(layer, atom)
+        && !atom.hunk_indices.is_empty()
+        && atom
+            .hunk_indices
+            .iter()
+            .any(|hunk_index| layer.hunk_indices.contains(hunk_index))
+}
+
+fn layer_symbols_match_atom(layer: &SemReviewLayer, atom: &SemReviewAtom) -> bool {
+    layer_file_paths_match_atom(layer, atom)
+        && (atom
+            .symbol_name
+            .as_ref()
+            .is_some_and(|symbol| layer.entity_names.contains(symbol))
+            || atom
+                .defined_symbols
+                .iter()
+                .chain(atom.referenced_symbols.iter())
+                .any(|symbol| layer.entity_names.contains(symbol)))
+}
+
+fn layer_file_paths_match_atom(layer: &SemReviewLayer, atom: &SemReviewAtom) -> bool {
+    layer
+        .file_paths
+        .iter()
+        .any(|path| atom_path_matches(atom, path))
+}
+
+fn atom_path_matches(atom: &SemReviewAtom, path: &str) -> bool {
+    atom.file_path == path || atom.old_file_path.as_deref() == Some(path)
+}
+
+fn range_overlaps_entity(
+    atom_range: Option<SemLineRange>,
+    entity_range: Option<&SemEntityRange>,
+) -> bool {
+    let Some(atom_range) = atom_range else {
+        return false;
+    };
+    let Some(entity_range) = entity_range else {
+        return false;
+    };
+    atom_range.start_line <= entity_range.end_line && entity_range.start_line <= atom_range.end_line
+}
+
+fn add_atom_layer_dependencies(layers: &mut [SemReviewLayer], atoms: &[SemReviewAtom]) {
+    let mut atom_to_layer = HashMap::<String, String>::new();
+    for layer in layers.iter() {
+        for atom_id in &layer.atom_ids {
+            atom_to_layer.insert(atom_id.clone(), layer.id.clone());
+        }
+    }
+
+    let mut symbol_owner = BTreeMap::<String, String>::new();
+    let mut atom_by_id = HashMap::<String, &SemReviewAtom>::new();
+    for atom in atoms {
+        atom_by_id.insert(atom.atom_id.clone(), atom);
+        let Some(layer_id) = atom_to_layer.get(&atom.atom_id) else {
+            continue;
+        };
+        for symbol in atom
+            .symbol_name
+            .iter()
+            .chain(atom.defined_symbols.iter())
+            .filter(|symbol| !symbol.is_empty())
+        {
+            symbol_owner
+                .entry(symbol.clone())
+                .or_insert_with(|| layer_id.clone());
+        }
+    }
+
+    for layer in layers {
+        let mut depends_on = BTreeSet::<String>::new();
+        for atom_id in &layer.atom_ids {
+            let Some(atom) = atom_by_id.get(atom_id) else {
+                continue;
+            };
+            if atom.role.as_deref().is_some_and(is_test_role) {
+                for owner_id in symbol_owner.values() {
+                    if owner_id != &layer.id {
+                        depends_on.insert(owner_id.clone());
+                    }
+                }
+            }
+            for symbol in &atom.referenced_symbols {
+                if let Some(owner_id) = symbol_owner.get(symbol) {
+                    if owner_id != &layer.id {
+                        depends_on.insert(owner_id.clone());
+                    }
+                }
+            }
+        }
+        layer.depends_on_layer_ids.extend(depends_on);
+        layer.depends_on_layer_ids.sort();
+        layer.depends_on_layer_ids.dedup();
+    }
+}
+
+fn atom_layer_key(atom: &SemReviewAtom) -> String {
+    if atom.role.as_deref().is_some_and(is_test_role) || path_is_test(&atom.file_path) {
+        return "tests".to_string();
+    }
+    if atom.role.as_deref().is_some_and(is_config_role) || path_is_config(&atom.file_path) {
+        return "config".to_string();
+    }
+    if atom.role.as_deref().is_some_and(is_foundation_role) {
+        return "foundation".to_string();
+    }
+    let directory = atom
+        .file_path
+        .rsplit_once('/')
+        .map(|(directory, _)| directory)
+        .unwrap_or(".");
+    format!("code:{directory}")
+}
+
+fn atom_layer_title(
+    key: &str,
+    entity_names: &BTreeSet<String>,
+    file_paths: &BTreeSet<String>,
+) -> String {
+    layer_title(key, entity_names, file_paths)
+}
+
+fn is_test_role(role: &str) -> bool {
+    role.eq_ignore_ascii_case("tests") || role.eq_ignore_ascii_case("test")
+}
+
+fn is_config_role(role: &str) -> bool {
+    role.eq_ignore_ascii_case("config")
+}
+
+fn is_foundation_role(role: &str) -> bool {
+    matches!(
+        role.to_ascii_lowercase().as_str(),
+        "foundation" | "model" | "schema" | "type"
+    )
+}
+
+fn path_is_test(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.contains("/test/")
+        || path.contains("/tests/")
+        || path.contains(".test.")
+        || path.contains(".spec.")
+        || path.ends_with("_test.rs")
+}
+
+fn path_is_config(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".toml")
+        || path.ends_with(".yaml")
+        || path.ends_with(".yml")
+        || path.ends_with(".json")
+        || path.ends_with(".lock")
 }
 
 fn diff_cache_key(changes: &[SemFileChange], options: &SemEmbeddedOptions) -> String {
@@ -1878,20 +2308,10 @@ fn sorted_strings(values: &[String]) -> Vec<String> {
 
 fn layer_key_for_change(change: &SemEmbeddedChange) -> String {
     let path = change.change.file_path.to_ascii_lowercase();
-    if path.contains("/test/")
-        || path.contains("/tests/")
-        || path.contains(".test.")
-        || path.contains(".spec.")
-        || path.ends_with("_test.rs")
-    {
+    if path_is_test(&path) {
         return "tests".to_string();
     }
-    if path.ends_with(".toml")
-        || path.ends_with(".yaml")
-        || path.ends_with(".yml")
-        || path.ends_with(".json")
-        || path.ends_with(".lock")
-    {
+    if path_is_config(&path) {
         return "config".to_string();
     }
     if matches!(
@@ -2056,6 +2476,43 @@ fn review_layer_cache_key(
             ),
         ],
     )
+}
+
+fn review_atom_layer_cache_key(
+    analysis: &SemDiffAnalysis,
+    atoms: &[SemReviewAtom],
+    layer_options: &SemLayerGenerationOptions,
+    options: &SemEmbeddedOptions,
+) -> String {
+    let mut parts = vec![
+        review_layer_cache_key(analysis, layer_options, options),
+        options_fingerprint(options),
+        format!(
+            "{}:{}",
+            layer_options.max_layers, layer_options.max_changes_per_layer
+        ),
+    ];
+    for atom in atoms {
+        parts.push(format!(
+            "{}:{}:{}:{}:{:?}:{:?}:{}:{}:{}:{}:{}",
+            atom.atom_id,
+            atom.file_path,
+            atom.old_file_path.as_deref().unwrap_or(""),
+            atom.role.as_deref().unwrap_or(""),
+            atom.old_range,
+            atom.new_range,
+            sorted_strings(&atom.defined_symbols).join(","),
+            sorted_strings(&atom.referenced_symbols).join(","),
+            atom.hunk_indices
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            atom.changed_lines,
+            atom.manual_review
+        ));
+    }
+    stable_cache_key("review-atom-layers", &parts)
 }
 
 fn impact_request_fingerprint(
@@ -2401,6 +2858,169 @@ pub fn caller() -> i32 {
             .layers
             .iter()
             .any(|layer| layer.title == "Update tests"));
+    }
+
+    #[test]
+    fn generate_review_layers_for_atoms_preserves_atom_ids() {
+        let changes = vec![SemFileChange {
+            file_path: "src/lib.rs".to_string(),
+            status: FileStatus::Modified,
+            old_file_path: None,
+            before_content: Some("fn helper() -> i32 { 1 }\n".to_string()),
+            after_content: Some("fn helper() -> i32 { 2 }\n".to_string()),
+            hunks: vec![SemHunk {
+                hunk_id: Some("hunk-0".to_string()),
+                hunk_index: 0,
+                hunk_header: None,
+                old_range: Some(SemLineRange {
+                    start_line: 1,
+                    end_line: 1,
+                }),
+                new_range: Some(SemLineRange {
+                    start_line: 1,
+                    end_line: 1,
+                }),
+            }],
+        }];
+        let atoms = vec![SemReviewAtom {
+            atom_id: "atom-helper".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            old_file_path: None,
+            role: Some("coreLogic".to_string()),
+            semantic_kind: Some("function".to_string()),
+            symbol_name: Some("helper".to_string()),
+            defined_symbols: vec!["helper".to_string()],
+            referenced_symbols: Vec::new(),
+            old_range: Some(SemLineRange {
+                start_line: 1,
+                end_line: 1,
+            }),
+            new_range: Some(SemLineRange {
+                start_line: 1,
+                end_line: 1,
+            }),
+            hunk_indices: vec![0],
+            changed_lines: 2,
+            manual_review: false,
+        }];
+
+        let plan = generate_review_layers_for_atoms(
+            &changes,
+            &atoms,
+            &SemLayerGenerationOptions::default(),
+            &SemEmbeddedOptions::default(),
+        );
+
+        assert!(plan
+            .layers
+            .iter()
+            .any(|layer| layer.atom_ids == vec!["atom-helper"]));
+        assert!(plan.manual_review_atom_ids.is_empty());
+        assert!(!plan.cache_key.is_empty());
+    }
+
+    #[test]
+    fn atom_layer_dependencies_link_tests_to_changed_symbols() {
+        let changes = vec![
+            SemFileChange {
+                file_path: "src/lib.rs".to_string(),
+                status: FileStatus::Modified,
+                old_file_path: None,
+                before_content: Some("fn helper() -> i32 { 1 }\n".to_string()),
+                after_content: Some("fn helper() -> i32 { 2 }\n".to_string()),
+                hunks: Vec::new(),
+            },
+            SemFileChange {
+                file_path: "tests/helper_test.rs".to_string(),
+                status: FileStatus::Modified,
+                old_file_path: None,
+                before_content: Some(
+                    "#[test]\nfn helper_test() { assert_eq!(1, helper()); }\n".to_string(),
+                ),
+                after_content: Some(
+                    "#[test]\nfn helper_test() { assert_eq!(2, helper()); }\n".to_string(),
+                ),
+                hunks: Vec::new(),
+            },
+        ];
+        let atoms = vec![
+            SemReviewAtom {
+                atom_id: "atom-helper".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                old_file_path: None,
+                role: Some("coreLogic".to_string()),
+                semantic_kind: Some("function".to_string()),
+                symbol_name: Some("helper".to_string()),
+                defined_symbols: vec!["helper".to_string()],
+                referenced_symbols: Vec::new(),
+                old_range: None,
+                new_range: None,
+                hunk_indices: Vec::new(),
+                changed_lines: 1,
+                manual_review: false,
+            },
+            SemReviewAtom {
+                atom_id: "atom-test".to_string(),
+                file_path: "tests/helper_test.rs".to_string(),
+                old_file_path: None,
+                role: Some("tests".to_string()),
+                semantic_kind: Some("function".to_string()),
+                symbol_name: Some("helper_test".to_string()),
+                defined_symbols: vec!["helper_test".to_string()],
+                referenced_symbols: vec!["helper".to_string()],
+                old_range: None,
+                new_range: None,
+                hunk_indices: Vec::new(),
+                changed_lines: 1,
+                manual_review: false,
+            },
+        ];
+
+        let plan = generate_review_layers_for_atoms(
+            &changes,
+            &atoms,
+            &SemLayerGenerationOptions::default(),
+            &SemEmbeddedOptions::default(),
+        );
+        let code_layer = plan
+            .layers
+            .iter()
+            .find(|layer| layer.atom_ids == vec!["atom-helper"])
+            .expect("code layer");
+        let test_layer = plan
+            .layers
+            .iter()
+            .find(|layer| layer.atom_ids == vec!["atom-test"])
+            .expect("test layer");
+
+        assert!(test_layer.depends_on_layer_ids.contains(&code_layer.id));
+    }
+
+    #[test]
+    fn manual_review_atoms_are_reported_without_layer_assignment() {
+        let plan = generate_review_layers_for_atoms(
+            &[],
+            &[SemReviewAtom {
+                atom_id: "atom-manual".to_string(),
+                file_path: "generated/output.rs".to_string(),
+                old_file_path: None,
+                role: Some("generated".to_string()),
+                semantic_kind: None,
+                symbol_name: None,
+                defined_symbols: Vec::new(),
+                referenced_symbols: Vec::new(),
+                old_range: None,
+                new_range: None,
+                hunk_indices: Vec::new(),
+                changed_lines: 10,
+                manual_review: true,
+            }],
+            &SemLayerGenerationOptions::default(),
+            &SemEmbeddedOptions::default(),
+        );
+
+        assert!(plan.layers.is_empty());
+        assert_eq!(plan.manual_review_atom_ids, vec!["atom-manual"]);
     }
 
     #[test]
